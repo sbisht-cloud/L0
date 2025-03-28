@@ -1,0 +1,207 @@
+#!//usr/bin/python3.6
+import argparse, csv, threading, sys, os, time, json, signal, xmltodict
+from datetime import datetime
+from ncclient import manager
+from time import sleep
+from collections import defaultdict
+
+USER = os.getlogin()
+CAPTIVE_CSV = '/home/{}/xxx/captives.csv'.format(USER)
+
+def sig_handler(signum, frame):
+    print("quitting..")
+    exit(1)
+
+def currtime():
+    now = datetime.now()
+    date_str = now.strftime('%B %d %H:%M:%S.%f')[:-3]
+    return date_str
+
+def ncc_connect(ip, username, password, port):
+    ncc_conn = None
+
+    retryCount = 0
+    retryMax   = 5
+    wait_count = 0
+    last_stmt = ''
+
+    while True:
+        try:
+            ncc_conn = manager.connect(host=ip,
+                                       port=port,
+                                       timeout=60,
+                                       username=username,
+                                       password=password,
+                                       hostkey_verify=False,
+                                       allow_agent=False,
+                                       look_for_keys=False)
+
+            print("> Connected to NETCONF({}).".format(ip))
+            ncc_conn.create_subscription()
+            print("> Subscribed to netconf events({}).".format(ip))
+            break
+        except Exception as e:
+            if 'Connecting' in last_stmt:
+                sys.stdout.write("\033[F")
+            if wait_count == 0:
+                last_stmt = 'Connecting {}.  '.format(ip)
+            elif wait_count == 1:
+                last_stmt = 'Connecting {}.. '.format(ip)
+            elif wait_count == 2:
+                last_stmt = 'Connecting {}...'.format(ip)
+            print (last_stmt)
+            wait_count += 1
+            wait_count %= 3
+            retryCount += 1
+            if retryCount < retryMax:
+                continue
+            else:
+                break
+    if ncc_conn == None:
+        sys.stdout.write("\033[F")
+        print("Error: Fail to connect Netconf ({})!".format(ip))
+        exit(1)
+
+    return ncc_conn
+
+def ncc_listen(ncc_conn, ip, username, password, port, output, filterkeys):
+    of = None
+    if output:
+        of = open(output, 'w')
+
+    print ('')
+
+    wait_count = 0
+    last_stmt = ''
+    while True:
+        try:
+            nc_output = ncc_conn.take_notification(block=True, timeout=0.5)
+            nc_out_format = xmltodict.parse(nc_output.notification_xml)["notification"]["yang-delivery"]
+
+            if filterkeys == None or filterkeys.intersection(list(nc_out_format['data'].keys())):
+                data = { 'timestamp' : currtime(), 'server': ip, 'data': nc_out_format }
+                log("< ", of)
+                log(json.dumps(data, indent=4), of)
+                last_stmt = ''
+
+        except Exception as e:
+            if 'Listening' in last_stmt:
+                sys.stdout.write("\033[F")
+            if wait_count == 0:
+                last_stmt = '< Listening {}.  '.format(ip)
+            elif wait_count == 1:
+                last_stmt = '< Listening {}.. '.format(ip)
+            elif wait_count == 2:
+                last_stmt = '< Listening {}...'.format(ip)
+            print (last_stmt)
+            wait_count += 1
+            wait_count %= 3
+
+def log (string, of):
+    print (string)
+    if of:
+        of.write (string+'\n')
+
+def validate_args (inputs):
+    if inputs.output:
+        try:
+            of = open(inputs.output, 'w')
+            if of:
+                of.close()
+        except Exception as e:
+            print ('error: failed to open output file: {}'.format(inputs.output))
+            sys.exit (1)
+
+def load_captive_csv():
+    if os.path.exists(CAPTIVE_CSV) == False:
+        PRINT('error: ' + CAPTIVE_CSV + ' does not exist!');
+        PRINT('Please create \"' + CAPTIVE_CSV + '\" in below format');
+        PRINT('#captive,#node,#ip\n'
+              '#CaptiveX\n'
+              'CaptiveX,West,192.168.122.3\n'
+              'CaptiveX,Central,192.168.122.2\n'
+              'CaptiveX,East,192.168.122.4\n')
+        exit()
+
+    reader = csv.reader(open(CAPTIVE_CSV, 'r'))
+    for row in reader:
+        if(len(row) != 3):
+            continue
+        cap_name, node_name, node_ip = row
+        node = {'node_name': node_name, 'ip': node_ip}
+        captive[cap_name].append(node)
+    exit
+
+def print_args (inputs):
+    if inputs.ipaddress:
+        print ('* server:  {}'. format(inputs.ipaddress))
+    if inputs.filter:
+        fmt_filters = inputs.filter.splitlines()
+        list_filters = set(list(fmt_filters))
+        print ('* filters: {}'. format(*list_filters))
+    if inputs.output:
+        print ('* output-file:  {}'. format(inputs.output))
+    print ('')
+
+def parse_arg(argv):
+    description = 'ncc: NETCONF Client (v1.1.0).'
+    usage = '\n  ncc -i 192.168.122.5 -f \'active-alarm\'\n  ncc -i 192.168.122.5 -o ncc.log\n  ncc -i 192.168.122.5\n\n  ncc -c bifrost_CDC_3nodes -f \'active-alarm\'\n  ncc -c bifrost_CDC_3nodes -o ncc.log\n  ncc -c bifrost_CDC_3nodes'
+    version = 'ncc 2.0.0'
+
+    parser = argparse.ArgumentParser(description=description, usage=usage)
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('-c', '--captive',    type=str, help='Name of captive.')
+    group.add_argument('-i', '--ipaddress',  type=str, help='Server ip-address.')
+    parser.add_argument('-p', '--port',       type=int, default=830, help='SSH port.')
+    parser.add_argument('-u', '--username',   type=str, default='su', help='SSH username.')
+    parser.add_argument('-a', '--password',   type=str, default='Ciena123!', help='SSH password.')
+    parser.add_argument('-f', '--filter',     type=str, help='Event filters in comma separated list, for e.g. \'active-alarm\'')
+    parser.add_argument('-o', '--output',     type=str, help='Output file.')
+    options = parser.parse_args(argv)
+    return options
+
+def ncc_handler(ipaddress, username, password, port, output, list_filters):
+    ncc_conn = ncc_connect ( ipaddress, username, password, port )
+    ncc_listen  ( ncc_conn, ipaddress, username, password, port, output, list_filters )
+
+    print("Netconf session closed")
+    ncc_conn.close_session()
+
+## MAIN
+def main():
+    """
+    Netconf Client to listen events from specified server.
+    """
+
+    global captive
+
+    list_filters = None
+
+    INPUTS = parse_arg(sys.argv[1:])
+
+    captive = defaultdict(list)
+    load_captive_csv()
+
+    print_args    (INPUTS)
+    validate_args (INPUTS)
+
+    signal.signal(signal.SIGINT, sig_handler)
+
+    all_threads = []
+
+    if INPUTS.ipaddress is not None:
+        INPUTS.captive = 'captive'
+        captive.clear()
+        captive['captive'].append( { 'node_name': 'xxx', 'ip': INPUTS.ipaddress } )
+
+    for node in captive[INPUTS.captive]:
+        ip = node['ip'];
+
+        threadX = threading.Thread(target=ncc_handler, args = (ip, INPUTS.username, INPUTS.password, INPUTS.port, INPUTS.output, list_filters))
+        all_threads.append(threadX)
+        threadX.start()
+
+    for threadX in all_threads:
+        threadX.join()
+
+main()
